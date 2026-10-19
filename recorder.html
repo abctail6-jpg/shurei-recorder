@@ -60,6 +60,10 @@ audio{width:100%}
 .tx:empty{display:none}
 .interim{color:var(--muted)}
 .note{font-size:13px;color:var(--muted);margin:0}
+.gainrow{display:flex;align-items:center;gap:10px;width:100%;max-width:420px;font-size:14px}
+.gainrow label{font-weight:700;flex:none}
+.gainrow input{flex:1;min-width:0;accent-color:var(--accent)}
+.gainrow output{flex:none;width:3.5em;text-align:right;font-variant-numeric:tabular-nums}
 .done{border:2px solid var(--accent);background:var(--accent-soft);border-radius:14px;padding:18px;text-align:center;font-weight:700}
 h2{font-size:15px;margin:0 0 10px}
 .sendbox{display:flex;flex-direction:column;gap:12px;align-items:center;text-align:center}
@@ -82,6 +86,12 @@ h2{font-size:15px;margin:0 0 10px}
       <button class="btn" id="btnStop" type="button" disabled>停止</button>
       <label class="chk"><input type="checkbox" id="liveTx" checked>同時に文字起こし</label>
     </div>
+    <div class="gainrow">
+      <label for="gain">マイク感度</label>
+      <input type="range" id="gain" min="1" max="8" step="0.5" value="4">
+      <output id="gainVal" for="gain">4倍</output>
+    </div>
+    <p class="note">部屋の端の声まで拾うには感度を上げます。録音中にメーターが赤くなり続けるなら下げてください。</p>
     <div class="tx" id="tx"></div>
     <p class="note">録音中はこの画面を開いたままにしてください。画面を閉じたり他のアプリに切り替えると録音が止まることがあります。</p>
   </section>
@@ -457,6 +467,12 @@ function toI16(f32,i16,off){for(let i=0;i<f32.length;i++){let v=f32[i];v=v<-1?-1
 
 /* ---------- 録音 ---------- */
 const N=24;$('#meter').innerHTML='<i></i>'.repeat(N);
+function gainNow(){return Number($('#gain').value)||4}
+function showGain(){$('#gainVal').textContent=gainNow()+'倍'}
+try{const g=localStorage.getItem('shurei-gain');if(g)$('#gain').value=g}catch(e){}
+showGain();
+$('#gain').addEventListener('input',()=>{showGain();try{localStorage.setItem('shurei-gain',$('#gain').value)}catch(e){}
+  if(st.gain&&st.ctx)try{st.gain.gain.setTargetAtTime(gainNow(),st.ctx.currentTime,0.05)}catch(e){st.gain.gain.value=gainNow()}});
 const elapsed=()=>st.acc+(st.state==='rec'?(performance.now()-st.t0)/1000:0);
 function ui(){const on=st.state==='rec'||st.state==='pause';const b=$('#btnRec');b.classList.toggle('on',on);b.setAttribute('aria-label',on?'録音を停止':'録音開始');
   $('#btnPause').disabled=!on;$('#btnStop').disabled=!on;$('#btnPause').textContent=st.state==='pause'?'再開':'一時停止';$('#liveTx').disabled=on;
@@ -465,12 +481,14 @@ function ui(){const on=st.state==='rec'||st.state==='pause';const b=$('#btnRec')
 async function start(){
   if(out&&!confirmDiscard())return;
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){$('#state').textContent='このブラウザでは録音できません（Safari か Chrome で開いてください）';return}
-  try{st.stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}})}
+  try{st.stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}})}
   catch(e){$('#state').textContent='マイクを使えませんでした。ブラウザのマイク許可を確認してください';return}
   clearOut();newEncoder();st.dsPos=0;st.acc=0;finalTx='';renderTx('');
   const AC=window.AudioContext||window.webkitAudioContext;st.ctx=new AC();try{await st.ctx.resume()}catch(e){}
   st.src=st.ctx.createMediaStreamSource(st.stream);st.an=st.ctx.createAnalyser();st.an.fftSize=1024;
-  st.proc=st.ctx.createScriptProcessor(4096,1,1);st.src.connect(st.an);st.src.connect(st.proc);st.proc.connect(st.ctx.destination);
+  st.gain=st.ctx.createGain();st.gain.gain.value=gainNow();
+  st.comp=st.ctx.createDynamicsCompressor();st.comp.threshold.value=-24;st.comp.knee.value=12;st.comp.ratio.value=6;st.comp.attack.value=0.005;st.comp.release.value=0.25;
+  st.proc=st.ctx.createScriptProcessor(4096,1,1);st.src.connect(st.gain);st.gain.connect(st.comp);st.comp.connect(st.an);st.comp.connect(st.proc);st.proc.connect(st.ctx.destination);
   st.proc.onaudioprocess=e=>{if(st.state!=='rec')return;pushPCM(e.inputBuffer.getChannelData(0),st.ctx.sampleRate);
     if(st.bytes>MAX_BYTES*0.97){stop();$('#state').textContent='録音が長くなったので自動で止めました（約60分まで）'}};
   st.state='rec';st.t0=performance.now();ui();
@@ -508,8 +526,10 @@ async function importFile(file){if(!file)return;if(st.state!=='idle'){$('#fileSt
   try{const ab=await file.arrayBuffer();const OAC=window.OfflineAudioContext||window.webkitOfflineAudioContext;const oc=new OAC(1,SR_RATE,SR_RATE);
     const buf=await new Promise((res,rej)=>{const p=oc.decodeAudioData(ab,res,rej);if(p&&p.then)p.then(res,rej)});
     const ch=buf.numberOfChannels,n=buf.length,data=[];for(let c=0;c<ch;c++)data.push(buf.getChannelData(c));
+    let peak=0;for(let c=0;c<ch;c++){const d=data[c];for(let k=0;k<n;k+=4){const v=Math.abs(d[k]);if(v>peak)peak=v}}
+    const norm=peak>0.001?Math.min(20,0.89/peak):1;
     newEncoder();const BLK=1152*40;const i16=new Int16Array(BLK);const mix=new Float32Array(BLK);
-    for(let i=0;i<n;i+=BLK){const len=Math.min(BLK,n-i);for(let k=0;k<len;k++){let s=0;for(let c=0;c<ch;c++)s+=data[c][i+k];mix[k]=s/ch}
+    for(let i=0;i<n;i+=BLK){const len=Math.min(BLK,n-i);for(let k=0;k<len;k++){let s=0;for(let c=0;c<ch;c++)s+=data[c][i+k];mix[k]=s/ch*norm}
       toI16(mix.subarray(0,len),i16,0);encode(i16.subarray(0,len));
       if(st.bytes>MAX_BYTES)throw new Error('音声が長すぎます（約60分まで）');
       if((i/BLK)%20===0){fs.textContent=`変換中… ${Math.round(i/n*100)}%`;await new Promise(r=>setTimeout(r,0))}}
